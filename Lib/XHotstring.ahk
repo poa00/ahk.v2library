@@ -52,8 +52,8 @@ class XHotstring {
         , __DefaultOptions := Map(), __ResetKeys := "{Left}{Right}{Up}{Down}{Next}{Prior}{Home}{End}"
         , __CurrentHotIf := "", __RegisteredHotstrings := [], __HotstringsReadyToTrigger := []
         , __MouseReset := 1, __hWnd := DllCall("GetForegroundWindow", "ptr"), __Hook := 0
-        , __ActiveEndChars := "", __ActiveNoModifierEndChars := "", __ActiveModifierEndChars := ""
-        , __SpecialChars := "^+!#{}", __ShiftPressed := 0
+        , __ActiveEndChars := "", __ActiveEndCharCallbacks := Map(), __EndCharHotkeyMap := Map()
+        , __SpecialChars := "^+!#{}", __KeybdLayout := 0
     /**
      * Registers or modifies a XHotstring. See documentation for `Hotstring` for more information.
      * @param {String} Trigger Either a trigger string in the format `:options:trigger`, or NewOptions that
@@ -156,28 +156,8 @@ class XHotstring {
     static EndChars {
         get => this.__EndChars
         set {
-            static lpKeyState := Buffer(256,0), pwszBuff := Buffer(4)
-            if !(Value is String) || Value = ""
-                throw ValueError("Invalid EndChars", -1)
             this.__EndChars := Value
-            this.__NoModifierEndChars := ""
-            this.__ModifierEndChars := InStr(Value, " ") ? " " : ""
-            if InStr(Value, "`n")
-                Value .= "`r"
-            NumPut("char", 0, lpKeyState, 0x10)
-            Loop parse Value {
-                if (len := DllCall("ToUnicode", "uint", VK := GetKeyVK(A_LoopField), "uint", SC := GetKeySC(A_LoopField), "ptr", lpKeyState, "ptr", pwszBuff, "int", pwszBuff.size, "uint", 0)) <= 0
-                    continue
-                if StrGet(pwszBuff, len, "UTF-16") == A_LoopField
-                    this.__NoModifierEndChars .= "{" A_LoopField "}"
-            }
-            NumPut("char", 0x80, lpKeyState, 0x10)
-            Loop parse Value {
-                if (len := DllCall("ToUnicode", "uint", VK := GetKeyVK(A_LoopField), "uint", SC := GetKeySC(A_LoopField), "ptr", lpKeyState, "ptr", pwszBuff, "int", pwszBuff.size, "uint", 0)) <= 0
-                    continue
-                if StrGet(pwszBuff, len, "UTF-16") == A_LoopField
-                    this.__ModifierEndChars .= "{" A_LoopField "}"
-            }
+            this.__TranslateEndChars()
         }
     }
     ; Can be used to resume the hotstring recognizer after stopping it with `XHotstring.Stop()`
@@ -206,7 +186,6 @@ class XHotstring {
         this.__Hook := InputHook("V L0 I" A_SendLevel)
         this.__Hook.KeyOpt(this.__ResetKeys "{Backspace}", "N")
         this.__Hook.OnKeyDown := this.__OnKeyDown.Bind(this)
-        this.__Hook.OnKeyUp := this.__OnKeyUp.Bind(this)
         this.__Hook.OnChar := this.__AddChar.Bind(this)
         ; These two throw critical recursion errors if defined with the normal syntax and AHK is ran in debugging mode
         this.DefineProp("MinSendLevel", {
@@ -220,19 +199,8 @@ class XHotstring {
     }
     static __AddChar(ih, char) {
         Critical
-        hWnd := DllCall("GetForegroundWindow", "ptr")
-        if char && InStr(this.EndChars, char) {
-            if hWnd != this.__hWnd {
-                if InStr(this.__ActiveEndChars, char) ; This was blocked, so resend it
-                    Send "{Blind}" char
-            } else {
-                for Active in this.__HotstringsReadyToTrigger {
-                    if Active.HS.HotIf = "" || Active.HS.HotIf.Call(Active.HS, Active.TriggerMatch)
-                        return this.__TriggerHS(Active.HS, Active.TriggerMatch, Active.Replacement, char)
-                }
-            }
-        }
         this.__DeactivateEndChars()
+        hWnd := DllCall("GetForegroundWindow", "ptr")
         if this.__hWnd != hWnd
             this.__hWnd := hWnd, this.HotstringRecognizer := ""
         if char = "" {
@@ -246,10 +214,10 @@ class XHotstring {
         for HS in this.__RegisteredHotstrings {
             if HS.Active && (Pos := RegExMatch(this.HotstringRecognizer, HS.Trigger, &Match:="")) && Match[] {
                 Replacement := HS.Options["M"] && !HS.Options["X"] ? SubStr(RegExReplace(this.HotstringRecognizer, HS.Trigger, HS.Replacement,,1), Pos) : HS.Replacement
-                if HS.Options["*"] && (HS.HotIf = "" || HS.HotIf.Call(HS, Match)) { 
+                if HS.Options["*"] && (HS.HotIf = "" || HS.HotIf.Call(HS, Match)) {
                     return this.__TriggerHS(HS, Match, Replacement, "")
                 } else {
-                    this.__ActivateEndChars(HS, Match, Replacement)
+                    this.__ActivateEndChars(HS, Match, Replacement, HS.HotIf)
                 }
             }
         }
@@ -258,26 +226,8 @@ class XHotstring {
         Critical
         if vk = 8
             this.__AddChar(ih, "")
-        else {
-            if (vk = 0xA0 || vk = 0xA1 || vk == 0x10) { ; Shift is pressed
-                this.__ShiftPressed := 1
-                if this.__ActiveNoModifierEndChars 
-                    this.__Hook.KeyOpt(this.__ActiveNoModifierEndChars, "-S")
-                if this.__ActiveEndChars
-                    this.__Hook.KeyOpt(this.__ActiveEndChars, "+S")
-            } else
-                this.Reset()
-        }
-    }
-    static __OnKeyUp(ih, vk, sc) {
-        Critical
-        if (vk = 0xA0 || vk = 0xA1 || vk == 0x10) { ; Shift is released
-            this.__ShiftPressed := 0
-            if this.__ActiveEndChars
-                this.__Hook.KeyOpt(this.__ActiveEndChars, "-S")
-            if this.__ActiveNoModifierEndChars
-                this.__Hook.KeyOpt(this.__ActiveNoModifierEndChars, "+S")
-        }
+        else
+            this.Reset()
     }
     static __ParseOptions(OptObj, OptStr, HS?) {
         Loop parse OptStr {
@@ -326,36 +276,58 @@ class XHotstring {
         }
         return OptStr
     }
-    static __ActivateEndChars(HS, TriggerMatch, Replacement) {
-        static lpKeyState := Buffer(256, 0)
-        if this.__ActiveEndChars
-            return
+    static __ActivateEndChars(HS, TriggerMatch, Replacement, HotIfCallback) {
         this.__HotstringsReadyToTrigger.Push({HS:HS, TriggerMatch:TriggerMatch, Replacement:Replacement})
         this.__ActiveEndChars := this.__EndChars
-        this.__ActiveNoModifierEndChars := this.__NoModifierEndChars
-        this.__ActiveModifierEndChars := this.__ModifierEndChars
-        ShiftState := GetKeyState("Shift")
-        if this.__ActiveModifierEndChars {
-            if ShiftState
-                this.__Hook.KeyOpt(this.__ActiveModifierEndChars, "+S")
-            this.__Hook.KeyOpt("{Shift}{LShift}{RShift}", "+N")
-        }
-        if this.__ActiveNoModifierEndChars && !ShiftState
-            this.__Hook.KeyOpt(this.__ActiveNoModifierEndChars, "+S")
+        this.__ActiveEndCharCallbacks[HotIfCallback] := activeCallbacks := Map()
+        this.__TranslateEndChars()
+        
+        prevHotIf := HotIf(HotIfCallback)
+        for key, hk in this.__EndCharHotkeyMap
+            Hotkey("$" hk, activeCallbacks[hk] := this.__TriggerHS.Bind(this, HS, TriggerMatch, Replacement, key), "On I" this.__Hook.MinSendLevel)
+        HotIf(prevHotIf)
     }
     static __DeactivateEndChars() {
-        if this.__ActiveEndChars = ""
-            return
-        this.__HotstringsReadyToTrigger := []
-        if this.__ActiveNoModifierEndChars
-            this.__Hook.KeyOpt(this.__ActiveNoModifierEndChars, "-S")
-        if this.__ActiveModifierEndChars
-            this.__Hook.KeyOpt(this.__ActiveModifierEndChars, "-S")
-        this.__Hook.KeyOpt("{Shift}{LShift}{RShift}", "-N")
+        for hotIfCallback, activeHotkeys in this.__ActiveEndCharCallbacks {
+            prevHotIf := HotIf(hotIfCallback)
+            for hk, hotkeyCallback in activeHotkeys
+                Hotkey("$" hk, hotkeyCallback, "Off")
+            HotIf(prevHotIf)     
+        }
         this.__ActiveEndChars := ""
+        this.__ActiveEndCharCallbacks := Map()
+    }
+    static __TranslateEndChars() {
+        hkl := DllCall("GetKeyboardLayout", "uint", 0)
+        if (this.__KeybdLayout == hkl)
+            return
+
+        this.__EndCharHotkeyMap := Map()
+        
+        for key in StrSplit(this.__EndChars) {
+            r := DllCall("VkKeyScanExW", "short", Ord(key), "uint", hkl, "short")
+            if (r == -1)
+                throw Error("EndKey '" key "' cannot be produced with a single keystroke on this layout.")
+            vk := r & 0xFF, mods := r >> 8
+            this.__EndCharHotkeyMap[key] := ModsToString() GetKeyName(key)
+        }
+        ; This is a special case because in the above code `n gets translated to ^Enter
+        if InStr(this.__EndChars, "`n")
+            this.__EndCharHotkeyMap["`n"] := "Enter"
+
+        ModsToString() {
+            ret := ""
+            if mods & 2
+                ret .= "^"
+            if mods & 1
+                ret .= "+"
+            if mods & 4
+                ret .= "!"
+            return ret
+        }
     }
     static __TriggerHS(HS, TriggerMatch, Replacement, EndChar, *) {
-        Critical 
+        Critical
         local opts := HS.Options, TriggerText := TriggerMatch[], BS := 0, B := opts["B"]
         this.__DeactivateEndChars()
 
